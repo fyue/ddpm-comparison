@@ -326,14 +326,14 @@ class BaseSampler(ABC):
         # ----------------------------------------------------------
         # [数式] 離散タイムステップのサブサンプリング:
         #
-        #   t_i = round( T - 1 - i * (T-1)/(N-1) )  for i=0,...,N-1
+        #   t_i = round( (T-1) - i * (T-1)/(N-1) )  for i=0,...,N-1
         #
+        # 両端 (t=T-1 と t=0) を必ず含む等間隔サンプリング。
         # 例: T=1000, N=20 → t = [999, 947, 894, ..., 52, 0]
         # ----------------------------------------------------------
-        step_ratio = self.num_train_timesteps // num_inference_steps
-        timesteps = (
-            torch.arange(0, num_inference_steps, dtype=torch.long) * step_ratio
-        ).flip(0)
+        timesteps = torch.linspace(
+            self.num_train_timesteps - 1, 0, num_inference_steps
+        ).round().long()
 
         self.timesteps = timesteps.to(device)
 

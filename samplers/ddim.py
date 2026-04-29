@@ -115,7 +115,8 @@ class DDIMSampler(BaseSampler):
         t = int(timestep.item()) if timestep.ndim == 0 else int(timestep[0].item())
 
         # 前のタイムステップ τ_{i-1} を計算
-        step_size = self.num_train_timesteps // self.num_inference_steps
+        # linspace サブサンプリングに合わせた間隔
+        step_size = (self.num_train_timesteps - 1) // (self.num_inference_steps - 1) if self.num_inference_steps > 1 else self.num_train_timesteps - 1
         t_prev = t - step_size
         t_prev = max(t_prev, 0)
 

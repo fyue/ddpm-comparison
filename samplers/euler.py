@@ -98,11 +98,10 @@ class EulerSampler(BaseSampler):
         """
         self.num_inference_steps = num_inference_steps
 
-        # 等間隔でタイムステップをサンプリング (降順)
-        step_ratio = self.num_train_timesteps // num_inference_steps
-        timesteps = (
-            torch.arange(0, num_inference_steps, dtype=torch.long) * step_ratio
-        ).flip(0)
+        # 等間隔でタイムステップをサンプリング (両端含む, 降順)
+        timesteps = torch.linspace(
+            self.num_train_timesteps - 1, 0, num_inference_steps
+        ).round().long()
         self.timesteps = timesteps.to(device)
 
         # sigma 列を取得 (降順, 末尾に 0 を付加)
