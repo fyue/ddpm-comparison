@@ -235,9 +235,9 @@ class SDPipeline:
         # スケールを元に戻す
         latents = latents / self.VAE_SCALE_FACTOR
 
-        # VAE デコード (float32 に変換してから実行、MPS 安定化)
-        latents_f32 = latents.float()
-        decoded = self.vae.decode(latents_f32).sample
+        # VAE デコード (VAE と同じ dtype に変換してから実行)
+        latents_vae = latents.to(dtype=self.torch_dtype)
+        decoded = self.vae.decode(latents_vae).sample
 
         # [-1, 1] → [0, 1]
         images = (decoded / 2.0 + 0.5).clamp(0.0, 1.0)
@@ -276,14 +276,15 @@ class SDPipeline:
         """
         B = x_scaled.shape[0]
         # uncond と cond を concat してバッチサイズ 2B で実行
-        x_input = x_scaled.repeat(2, 1, 1, 1)  # [2B, 4, H, W]
+        x_input = x_scaled.repeat(2, 1, 1, 1).to(dtype=self.torch_dtype)  # [2B, 4, H, W]
         t_input = timestep.repeat(2)            # [2B]
+        enc_hs = encoder_hidden_states.to(dtype=self.torch_dtype)
 
         with torch.no_grad():
             v_both = self.unet(
                 x_input,
                 t_input,
-                encoder_hidden_states=encoder_hidden_states,
+                encoder_hidden_states=enc_hs,
             ).sample  # [2B, 4, H, W]
 
         v_uncond, v_cond = v_both.chunk(2, dim=0)  # 各 [B, 4, H, W]

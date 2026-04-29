@@ -7,12 +7,12 @@ dependencies:
   - pip
   - pip:
     # ----------------------------------------------------------------
-    # PyTorch  — pip 経由で MPS (Apple Silicon) 対応ビルドを取得する。
-    # conda-forge の torch は MPS 未対応ビルドが混在するため pip 推奨。
-    # CUDA 環境でも pip の cu12x ビルドで動作する。
+    # PyTorch  — pip 経由で CUDA 12.4 対応ビルドを取得する。
+    # CUDA 12.x ドライバー (12.4〜12.9) と互換性あり。
+    # MPS (Apple Silicon) 環境では --index-url を除いて再インストール。
     # ----------------------------------------------------------------
-    - torch
-    - torchvision
+    - torch --index-url https://download.pytorch.org/whl/cu124
+    - torchvision --index-url https://download.pytorch.org/whl/cu124
 
     # ----------------------------------------------------------------
     # Hugging Face スタック
