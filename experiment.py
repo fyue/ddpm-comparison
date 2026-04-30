@@ -57,7 +57,11 @@ from samplers import build_sampler, SAMPLER_REGISTRY, NFE_PER_STEP
 PROMPT = "a photo of an astronaut riding a horse on mars"
 SEED   = 42
 GUIDANCE_SCALE = 7.5
-STEP_LIST = [10, 20, 50]  # 比較するステップ数
+STEP_LIST = [10, 20, 50]  # デフォルトの比較ステップ数
+# サンプラーごとに異なるステップ数を使いたい場合はここで上書き
+STEP_LIST_OVERRIDE: dict = {
+    "ddpm": [300, 700, 1000],
+}
 MODEL_ID  = "CompVis/stable-diffusion-v1-4"
 
 # 実験するサンプラー名のリスト (SAMPLER_REGISTRY のキー)
@@ -161,11 +165,14 @@ def run_experiments(
     # ------------------------------------------------------------------
     # 各サンプラー × 各ステップ数
     # ------------------------------------------------------------------
-    total = len(SAMPLER_NAMES) * len(STEP_LIST)
+    total = sum(
+        len(STEP_LIST_OVERRIDE.get(name, STEP_LIST)) for name in SAMPLER_NAMES
+    )
     count = 0
 
     for sampler_name in SAMPLER_NAMES:
-        for steps in STEP_LIST:
+        step_list = STEP_LIST_OVERRIDE.get(sampler_name, STEP_LIST)
+        for steps in step_list:
             count += 1
             print(f"\n[{count}/{total}] sampler={sampler_name}, steps={steps}")
 

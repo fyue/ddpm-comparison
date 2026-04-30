@@ -340,8 +340,12 @@ class DPMSolver(EulerSampler):
             lambda_prev = self._lambda_buffer[-1]
 
             h = lambda_tm1 - lambda_t
+            h_float = float(h)
+            if abs(h_float) < 1e-6:
+                # 最終ステップ (h≈0): order-1 にフォールバック
+                return self._order1_step(x_t, d_theta_t, alpha_t, alpha_tm1, lambda_t, lambda_tm1)
             h_prev = float(lambda_t) - lambda_prev    # > 0
-            r_0 = h_prev / float(h)
+            r_0 = h_prev / h_float
 
             phi1 = torch.expm1(h)
             order1 = self._order1_step(
@@ -384,6 +388,9 @@ class DPMSolver(EulerSampler):
             lambda_2 = self._lambda_buffer[-2]       # λ_{t-2}
 
             h  = float(lambda_tm1 - lambda_t)
+            if abs(h) < 1e-6:
+                # 最終ステップ (h≈0): order-1 にフォールバック
+                return self._order1_step(x_t, d_theta_t, alpha_t, alpha_tm1, lambda_t, lambda_tm1)
             h1 = float(lambda_t) - lambda_1
             h2 = lambda_1 - lambda_2
 
@@ -462,6 +469,13 @@ class DPMSolver(EulerSampler):
         alpha_t,   sigma_t,   lambda_t   = self._get_alpha_sigma(t, dev)
         alpha_tm1, sigma_tm1, lambda_tm1 = self._get_alpha_sigma(t_next, dev)
         d_theta_t = self._get_denoiser(model_output, sample, t)
+
+        # 最終ステップ (h≈0) は order-1 で処理
+        if abs(float(lambda_tm1 - lambda_t)) < 1e-6:
+            order1_result = self._order1_step(
+                sample, d_theta_t, alpha_t, alpha_tm1, lambda_t, lambda_tm1
+            )
+            return SchedulerOutput(prev_sample=order1_result, pred_original_sample=d_theta_t)
 
         if self.order == 1:
             # Order 1 は singlestep == multistep

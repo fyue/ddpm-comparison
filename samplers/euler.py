@@ -171,7 +171,9 @@ class EulerSampler(BaseSampler):
             sigma_t = (sigma_ode / c).view(1, 1, 1, 1)
             return predict_x0(model_output, x_t / c, alpha_t, sigma_t)
         else:  # epsilon (SD 1.x)
-            return x_t * c - sigma_ode * model_output
+            # x̂_0 = x_t − σ_ODE * ε_θ
+            # (x_t は sigma 空間の未スケール潜在変数、c 倍は不要)
+            return x_t - sigma_ode * model_output
 
     # ----------------------------------------------------------------
     # step の実装

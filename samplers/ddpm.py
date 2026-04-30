@@ -137,7 +137,8 @@ class DDPMSampler(BaseSampler):
           sample       : x_t           shape [B, C, H, W]
         """
         t = int(timestep.item()) if timestep.ndim == 0 else int(timestep[0].item())
-        step_size = (self.num_train_timesteps - 1) // (self.num_inference_steps - 1) if self.num_inference_steps > 1 else self.num_train_timesteps - 1
+        # set_timesteps と同じ step_ratio を使用して整合性を保つ
+        step_size = self.num_train_timesteps // self.num_inference_steps
         t_prev = t - step_size
         t_prev = max(t_prev, 0)
 
