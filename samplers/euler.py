@@ -130,6 +130,13 @@ class EulerSampler(BaseSampler):
         DDIM/DDPM は x_t の分散がすでに 1 に近いため不要だが、
         sigma 空間では σ が大きい (ノイズが多い) ステップで
         |x| が大きくなるため正規化が必要。
+
+        ※ この変換は EDM 空間 → VP 空間への写像でもある:
+             x^{VP} = x^{EDM} / √(σ²+1) = x^{EDM} / c
+           EDM 空間の初期ノイズは N(0, σ_max²·I) であり、
+           /c することで UNet の期待する N(0, I) 付近に戻る。
+           初期 latent を N(0, I) のまま渡すと /c 後が N(0, 1/σ_max²) となり
+           UNet の訓練分布から大きく外れる (単色画像の原因)。
         ---------------------------------------------------------------
         """
         t = int(timestep.item()) if timestep.ndim == 0 else int(timestep[0].item())
@@ -159,10 +166,15 @@ class EulerSampler(BaseSampler):
           x̂_0 = predict_x0(v_θ, x_t/c, 1/c, σ/c)
 
         [epsilon-prediction] (SD 1.x):
-          x̂_0 = x_t * c − σ * ε_θ   where c = √(σ²+1)
+          x̂_0 = x_t − σ * ε_θ
 
-          導出: x_t = α_t*x0 + σ_t*ε, α_t=1/c, σ_t=σ/c より
-            x0 = (x_t − (σ/c)*ε) * c = x_t*c − σ*ε
+          導出: 引数 x_t は EDM 空間の未スケール潜在変数。
+            EDM forward process: x_t^{EDM} = x_0 + σ * ε  (VP スケーリングなし)
+            → x̂_0 = x_t^{EDM} − σ * ε_θ
+
+          ※ VP 空間で書くと x_t^{VP} = x_t/c なので
+               x̂_0 = c * x_t^{VP} − σ * ε_θ = x_t − σ * ε_θ
+             と一致する。コード中の x_t は EDM 空間なので c の乗算は不要。
         ---------------------------------------------------------------
         """
         c = (sigma_ode ** 2 + 1.0).sqrt()
@@ -171,8 +183,7 @@ class EulerSampler(BaseSampler):
             sigma_t = (sigma_ode / c).view(1, 1, 1, 1)
             return predict_x0(model_output, x_t / c, alpha_t, sigma_t)
         else:  # epsilon (SD 1.x)
-            # x̂_0 = x_t − σ_ODE * ε_θ
-            # (x_t は sigma 空間の未スケール潜在変数、c 倍は不要)
+            # EDM 空間: x_t = x_0 + σ * ε  →  x̂_0 = x_t − σ * ε_θ
             return x_t - sigma_ode * model_output
 
     # ----------------------------------------------------------------
@@ -195,11 +206,10 @@ class EulerSampler(BaseSampler):
         出力: x_{i+1}
 
         Step 1 — UNet 出力から D_θ (= x̂_0) を復元:
-          x_t = scale_model_input で既にスケーリング済みの入力
-          x̂_0 = α_t * x_t − σ_t * v_θ   (v-prediction 変換)
-
-          注意: UNet には x_i/√(σ²+1) が入力されているため、
-          v_θ は元のスケール x_i に対する推定値に変換が必要。
+          sample は EDM 空間の未スケール潜在変数 x_i。
+          UNet は scale_model_input で x_i/√(σ²+1) = x_i^{VP} を受け取るが、
+          step には元の x_i が渡される (pipeline: step(sample=latents) 参照)。
+          _sigma_to_x0 が x_i → x̂_0 の変換を担う。
 
         Step 2 — ODE の傾き d を計算 (EDM Eq.4):
           d_i = (x_i − D_θ(x_i, σ_i)) / σ_i
@@ -229,20 +239,18 @@ class EulerSampler(BaseSampler):
         # ----------------------------------------------------------
         # Step 1: D_θ (= x̂_0) を復元
         #
-        # UNet には x_scaled = x_i / √(σ²+1) が入力されている。
-        # v_θ は x_scaled 基準なので、x_i 基準に戻す。
+        # sample (= x_i) は EDM 空間の未スケール潜在変数。
+        # pipeline では UNet 呼び出しに scale_model_input(x_i) = x_i/c を使うが、
+        # step には元の x_i が届く (pipeline.py: step(sample=latents) を参照)。
         #
-        # [数式] sigma 空間での x̂_0:
-        #   ᾱ_t = 1 / √(σ_ODE² + 1)   (定義から逆算)
-        #   σ_t^orig = σ_ODE / √(σ_ODE² + 1)
-        #
-        # denoiser D_θ は x̂_0 に相当するため:
-        #   D_θ(x_i, σ_i) = (x_i − σ_i * ε̂) / α_t
-        #
-        # v-prediction の場合は predict_x0 を直接適用できる。
-        # alpha と sigma を sigma_ode から再計算:
-        #   alpha_t = 1 / √(σ_i² + 1)
-        #   sigma_t_orig = σ_i / √(σ_i² + 1)
+        # _sigma_to_x0 が prediction_type に応じて x_i → x̂_0 を計算する:
+        #   [v_prediction]
+        #     x_i を VP 空間に変換: x_i^{VP} = x_i / c,  c = √(σ_i²+1)
+        #     VP 空間の alpha/sigma: α_t = 1/c,  σ_t = σ_i/c
+        #     predict_x0(v_θ, x_i^{VP}, α_t, σ_t) = α_t*x_i^{VP} − σ_t*v_θ = x̂_0
+        #   [epsilon]
+        #     EDM forward: x_i = x_0 + σ_i * ε
+        #     → x̂_0 = x_i − σ_i * ε_θ
         # ----------------------------------------------------------
         x0_hat = self._sigma_to_x0(model_output, sample, sigma_i)
         x0_hat = x0_hat.clamp(-1.0, 1.0)

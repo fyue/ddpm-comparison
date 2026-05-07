@@ -35,6 +35,9 @@ v-prediction (SD 2.1 の予測タイプ):
   [DDPM]   Ho et al., 2020. https://arxiv.org/abs/2006.11239
   [DDIM]   Song et al., 2020. https://arxiv.org/abs/2010.02502
   [v-pred] Salimans & Ho, 2022. https://arxiv.org/abs/2202.00512
+  [SDE]    Song et al., 2021. "Score-Based Generative Modeling through SDEs"
+           ICLR 2021. https://arxiv.org/abs/2011.13456
+           (VP-SDE / VE-SDE / sub-VP-SDE の統一的フレームワーク)
 """
 
 from __future__ import annotations
@@ -56,19 +59,37 @@ class NoiseSchedule:
     """
     SD 2.1 の scaled_linear ノイズスケジュールを計算し保持するクラス。
 
-    scaled_linear スケジュール (diffusers 実装準拠):
-      β_t = ( √β_start + t/(T-1) * (√β_end − √β_start) )²
-
-    ここでは 0-indexed: t ∈ {0, 1, ..., T-1}
-
-    主要なテンソル (shape: [T]):
-      betas        : β_t
-      alphas       : α_t = 1 − β_t
-      alphas_cumprod : ᾱ_t = Π_{s=0}^{t} α_s
-      sqrt_alphas_cumprod : √ᾱ_t  = α_t (signal scale)
-      sqrt_one_minus_alphas_cumprod : √(1−ᾱ_t) = σ_t (noise scale)
-      sigmas_for_ode : σ_t^ODE = √(1−ᾱ_t) / √ᾱ_t  (Euler/Heun/LMS/DPM で使用)
-      log_snr      : λ_t = log(ᾱ_t / (1−ᾱ_t)) = log(α_t² / σ_t²)
+    # ─── VP-SDE との対応 ───────────────────────────────────────────
+    # このスケジュールは VP-SDE (Variance Preserving SDE) の離散化版。
+    #
+    # VP-SDE の forward process (Song et al. 2021, ICLR):
+    #   dx = -½ β(t) x dt + √β(t) dW
+    #
+    # 離散化すると:
+    #   x_t = √ᾱ_t * x_0 + √(1−ᾱ_t) * ε,  ε ∼ N(0, I)
+    #
+    # 分散保存条件: α_t² + σ_t² = ᾱ_t + (1−ᾱ_t) = 1  ✓
+    #
+    # 各サンプラーと SDE/ODE の対応:
+    #   DDPMSampler  → VP-SDE の Euler-Maruyama 離散化 (確率的)
+    #   DDIMSampler  → VP-SDE の確率フロー ODE 離散化 (決定論的)
+    #   EulerSampler → VP-SDE ODE を σ 空間で Euler 法
+    #   HeunSampler  → VP-SDE ODE を σ 空間で Heun 法 (2次精度)
+    #   LMS2Sampler  → VP-SDE ODE を σ 空間で線形多段法
+    #   DPMSolver    → VP-SDE ODE を log-SNR 空間で高次解法
+    #
+    # ─── VE-SDE との違い ───────────────────────────────────────────
+    # VE-SDE (Variance Exploding SDE, SMLD/NCSNv2) の forward process:
+    #   x_t = x_0 + σ_t * ε,  σ_t → ∞ (分散爆発)
+    #
+    # VP-SDE との根本的な差異:
+    #   VP-SDE: α_t² + σ_t² = 1  (信号+ノイズの分散が保存)
+    #   VE-SDE: 信号スケールが常に 1、σ_t が ∞ に発散
+    #
+    # SD 2.1 は VP-SDE + v-prediction で学習されているため、
+    # VE-SDE ベースのサンプラー (NCSN++ 等) はそのまま適用不可。
+    # VE-SDE を使うには VE-SDE で学習されたモデルが別途必要。
+    # ────────────────────────────────────────────────────────────────
     """
 
     def __init__(

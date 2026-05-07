@@ -353,6 +353,10 @@ class SDPipeline:
         sampler.prediction_type = self.prediction_type
         sampler.set_timesteps(num_inference_steps, device=device)
 
+        # sigma 空間サンプラー (Euler/Heun/LMS) は sigma_max でスケール
+        if hasattr(sampler, '_sigmas') and sampler._sigmas is not None:
+            latents = latents * sampler._sigmas[0]  # sigma_max ≈ 14.6
+
         # UNet フォワード関数 (Heun / DPM-Solver singlestep から呼ばれる)
         def unet_forward_fn(x, t, enc_hs):
             return self._unet_forward_cfg(x, t, enc_hs, guidance_scale)
@@ -423,6 +427,8 @@ class SDPipeline:
         seed: int = 42,
         num_inference_steps: int = 250,
         guidance_scale: float = 7.5,
+        height: int = 512,
+        width: int = 512,
     ) -> torch.Tensor:
         """
         品質比較の基準となるリファレンス画像を生成する。
@@ -448,5 +454,7 @@ class SDPipeline:
             num_inference_steps=num_inference_steps,
             guidance_scale=guidance_scale,
             seed=seed,
+            height=height,
+            width=width,
         )
         return image
