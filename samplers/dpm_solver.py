@@ -63,7 +63,7 @@ from typing import Callable, Deque, Union
 
 import torch
 
-from .base import SchedulerOutput
+from .base import BaseSampler, SchedulerOutput
 from .euler import EulerSampler
 
 
@@ -75,11 +75,10 @@ class _DPMSolverBase(EulerSampler):
     """
     DPM-Solver 各クラスが継承する共通基底。
 
-    EulerSampler からは以下を引き継ぐ:
-      - sigma スケジュール (_sigmas, _timestep_to_idx)
-      - scale_model_input()  : x / sqrt(σ²+1)  (EDM→VP 変換)
-      - _sigma_to_x0()       : model_output → x̂_0
-      - set_timesteps()      : σ 列の構築
+    実装上は EulerSampler を継承しているが、DPM-Solver++ の更新式は
+    VP 空間の x_t = α_t x_0 + σ_t ε を前提にする。
+    そのため set_timesteps() / scale_model_input() は BaseSampler と同じ
+    VP 用の挙動に戻し、Euler の EDM sigma スケーリングは使わない。
 
     本クラスが追加するヘルパー:
       - _get_lambda_alpha()  : t_idx → (λ_t, α_t)
@@ -92,16 +91,38 @@ class _DPMSolverBase(EulerSampler):
     # スケジュール値取得
     # ----------------------------------------------------------------
 
+    def set_timesteps(
+        self,
+        num_inference_steps: int,
+        device: Union[str, torch.device] = "cpu",
+    ) -> None:
+        """
+        VP 空間用のタイムステップ列を設定する。
+
+        EulerSampler の sigma 列を作ると pipeline 側で初期 latent が
+        sigma_max 倍されるため、DPM-Solver++ では BaseSampler と同じ
+        N(0, I) latent を使う。
+        """
+        BaseSampler.set_timesteps(self, num_inference_steps, device)
+        self._sigmas = None
+        self._timestep_to_idx = {int(t): i for i, t in enumerate(self.timesteps)}
+
+    def scale_model_input(
+        self, sample: torch.Tensor, timestep: torch.Tensor
+    ) -> torch.Tensor:
+        """VP 空間では DDIM/DDPM と同じく UNet 入力をそのまま渡す。"""
+        return BaseSampler.scale_model_input(self, sample, timestep)
+
     def _get_lambda_alpha(self, t_idx: int, device: torch.device):
         """
         タイムステップインデックス t_idx から (λ_t, α_t) を返す。
 
-        λ_t = log(ᾱ_t / (1−ᾱ_t))  (log-SNR)
+        λ_t = log(α_t / σ_t) = 0.5 * log(ᾱ_t / (1−ᾱ_t))
         α_t = sqrt(ᾱ_t)             (signal scale)
 
         戻り値: (lambda_t, alpha_t)  いずれもスカラーテンソル
         """
-        lambda_t = self.schedule.log_snr[t_idx].to(device)
+        lambda_t = 0.5 * self.schedule.log_snr[t_idx].to(device)
         alpha_t  = self.schedule.sqrt_alphas_cumprod[t_idx].to(device)
         return lambda_t, alpha_t
 
@@ -119,28 +140,24 @@ class _DPMSolverBase(EulerSampler):
         UNet 出力 model_output と潜在変数 x から D_θ (= x̂_0) を計算する。
 
         ---------------------------------------------------------------
-        x は EDM 空間の未スケール潜在変数 (= pipeline の latents)。
-        UNet への入力は scale_model_input で x/c にスケールされているが、
-        step() には元の x が渡されるため、ここで再度スケールして x̂_0 を求める。
+        x は VP 空間の潜在変数 (= pipeline の latents)。
 
         [v_prediction] (SD 2.x):
-          c = sqrt(σ_ODE² + 1)
-          x̂_0 = predict_x0(v_θ, x/c, 1/c, σ_ODE/c)
+          x̂_0 = α_t x_t − σ_t v_θ
 
         [epsilon] (SD 1.x):
-          x̂_0 = x − σ_ODE * ε_θ
+          x̂_0 = (x_t − σ_t ε_θ) / α_t
         ---------------------------------------------------------------
 
         Args:
           model_output : UNet 出力テンソル (v_θ または ε_θ)
-          x            : EDM 空間の潜在変数 (未スケール)
+          x            : VP 空間の潜在変数
           t_idx        : タイムステップインデックス (整数)
         Returns:
-          x̂_0 (clamp 済み, [-1, 1])
+          x̂_0
         """
-        sigma_ode = self.schedule.sigmas_for_ode[t_idx].to(x.device)
-        x0_hat = self._sigma_to_x0(model_output, x, sigma_ode)
-        return x0_hat.clamp(-1.0, 1.0)
+        x0_hat, _ = self._predict_x0_eps(model_output, x, t_idx)
+        return x0_hat
 
     # ----------------------------------------------------------------
     # Order 1 の 1 ステップ更新
@@ -162,10 +179,9 @@ class _DPMSolverBase(EulerSampler):
         [数式] DPM-Solver++ Eq.14:
 
           h   = λ_{t-1} − λ_t          (> 0)
-          φ_1 = e^h − 1
 
-          x_{t-1} = (α_{t-1} / α_t) * x_t
-                    − α_{t-1} * φ_1 * D_θ(x_t, t)
+          x_{t-1} = (α_{t-1} / α_t) * e^{-h} * x_t
+                    + α_{t-1} * (1 − e^{-h}) * D_θ(x_t, t)
 
         DDIM (η=0) と数学的に等価 (Lu et al. 2022, Appendix B.1)。
 
@@ -180,10 +196,13 @@ class _DPMSolverBase(EulerSampler):
           x_{t-1}
         ---------------------------------------------------------------
         """
-        h    = lambda_tm1 - lambda_t          # > 0
-        phi1 = torch.expm1(h)                 # e^h − 1 (数値安定版)
+        h = lambda_tm1 - lambda_t          # > 0
+        exp_neg_h = torch.exp(-h)
 
-        return (alpha_tm1 / alpha_t) * x_t - alpha_tm1 * phi1 * d_theta_t
+        return (
+            (alpha_tm1 / alpha_t) * exp_neg_h * x_t
+            + alpha_tm1 * (1.0 - exp_neg_h) * d_theta_t
+        )
 
     # ----------------------------------------------------------------
     # タイムステップインデックスの解決
@@ -389,7 +408,7 @@ class DPMSolver2Singlestep(_DPMSolverBase):
         # 離散スケジュールなので log_snr テーブルから最近傍インデックスを探す
         # ----------------------------------------------------------
         lambda_mid = (lambda_t + lambda_tm1) / 2.0
-        log_snr    = self.schedule.log_snr.to(dev)
+        log_snr    = 0.5 * self.schedule.log_snr.to(dev)
         t_mid_idx  = int(torch.argmin(torch.abs(log_snr - lambda_mid)).item())
 
         lambda_mid_actual, alpha_mid = self._get_lambda_alpha(t_mid_idx, dev)

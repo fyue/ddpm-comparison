@@ -1,0 +1,32 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "experiment.py",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/experiment.py",
+            "args": [],
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "experiment.py --dry-run",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/experiment.py",
+            "args": ["--dry-run"],
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "experiment.py --output-dir out/",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/experiment.py",
+            "args": ["--output-dir", "out/"],
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}"
+        }
+    ]
+}
