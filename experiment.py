@@ -61,21 +61,24 @@ STEP_LIST = [10, 20, 50]  # デフォルトの比較ステップ数
 # サンプラーごとに異なるステップ数を使いたい場合はここで上書き
 STEP_LIST_OVERRIDE: dict = {
     "ddpm": [300, 700, 1000],
+    "ddim": [10, 20, 50, 100, 200],
+    "euler": [100, 250, 500],
 }
+# MODEL_ID  = "sd2-community/stable-diffusion-2-1"
 MODEL_ID  = "CompVis/stable-diffusion-v1-4"
+HEIGHT    = 512  # SD 1.4 は 512x512 で学習
+WIDTH     = 512
 
 # 実験するサンプラー名のリスト (SAMPLER_REGISTRY のキー)
 SAMPLER_NAMES = [
-    "ddpm",
-    "ddim",
-    "euler",
-    "heun",
-    "lms2",
+    # "ddpm",
+    # "ddim",
+    # "euler",
+    # "heun",
+    # "lms2",
     "dpm_solver_1",
-    "dpm_solver_2_single",
-    "dpm_solver_2_multi",
-    "dpm_solver_3_single",
-    "dpm_solver_3_multi",
+    # "dpm_solver_2_single",
+    # "dpm_solver_2_multi",
 ]
 
 
@@ -146,6 +149,8 @@ def run_experiments(
         seed=SEED,
         num_inference_steps=250,
         guidance_scale=GUIDANCE_SCALE,
+        height=HEIGHT,
+        width=WIDTH,
     )
     ref_time = time.perf_counter() - t0
 
@@ -194,6 +199,8 @@ def run_experiments(
                     num_inference_steps=steps,
                     guidance_scale=GUIDANCE_SCALE,
                     seed=SEED,
+                    height=HEIGHT,
+                    width=WIDTH,
                 )
             except Exception as e:
                 print(f"  [エラー] {sampler_name} steps={steps}: {e}")

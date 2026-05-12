@@ -1,5 +1,5 @@
 """
-samplers/dpm_solver.py — DPM-Solver (order=1/2/3, singlestep/multistep)
+samplers/dpm_solver.py — DPM-Solver++ (4 クラス構成)
 =============================================================================
 
 論文:
@@ -14,228 +14,219 @@ samplers/dpm_solver.py — DPM-Solver (order=1/2/3, singlestep/multistep)
   https://arxiv.org/abs/2211.01095
 
 概要:
-  DPM-Solver は拡散 ODE を log-SNR 空間 (λ 空間) で解析解を求め、
+  DPM-Solver は拡散 ODE を log-SNR 空間 (λ 空間) で解析的に解き、
   Taylor 展開により高次精度を達成するサンプラー。
+  本ファイルは役割を明確にするため 4 つのクラスに分割している。
 
-  連続時間 ODE (DPM-Solver++ の data-prediction 形式):
-    dx/dλ = x − D_θ(x, t)    ... D_θ は x̂_0 の推定値
+  クラス構成:
+    _DPMSolverBase       — 共通基底 (EulerSampler 継承 + ヘルパー)
+    DPMSolver1           — Order 1 singlestep (DDIM η=0 と等価)
+    DPMSolver2Singlestep — Order 2 singlestep (NFE=2、中間点で 2 回目フォワード)
+    DPMSolverMultistep1  — Order 1 multistep  (NFE=1、DPMSolver1 と数式同一)
+    DPMSolverMultistep2  — Order 2 multistep  (NFE=1、前ステップ D_θ を再利用)
 
-  log-SNR λ_t = log(ᾱ_t / (1−ᾱ_t)) = log(α_t² / σ_t²)
-
-  各 order の NFE/step:
-    Order 1 (singlestep = multistep) : NFE = 1
-    Order 2 singlestep               : NFE = 2
-    Order 2 multistep                : NFE = 1 (前ステップ再利用)
-    Order 3 singlestep               : NFE = 3
-    Order 3 multistep                : NFE = 1 (前 2 ステップ再利用)
-
-  ⚠️ Order 1 は DDIM (η=0) と数学的に等価。
+  log-SNR と VP-SDE パラメータの関係:
+    λ_t = log(ᾱ_t / (1−ᾱ_t)) = log(α_t² / σ_t²)
+    α_t = √ᾱ_t  (signal scale)
+    σ_t = √(1−ᾱ_t)  (noise scale)
+    α_t² + σ_t² = 1   (VP-SDE の分散保存条件)
 
 =============================================================================
-DPM-Solver++ の更新式 (data-prediction form):
+DPM-Solver++ の更新式 (data-prediction form, Eq.14/16/17):
 =============================================================================
 
-[Order 1] — Taylor 展開 0 次項のみ (= DDIM)
+  共通定義:
+    h = λ_{t-1} − λ_t  (> 0、ノイズ減少方向)
+    φ_1 = e^h − 1
 
-  x_{t-1} = (α_{t-1}/α_t) * x_t
-             − α_{t-1} * (e^h − 1) * D_θ(x_t, t)
+  [Order 1]:
+    x_{t-1} = (α_{t-1}/α_t) * x_t − α_{t-1} * φ_1 * D_θ(x_t, t)
 
-  ここで h = λ_{t-1} − λ_t > 0
+  [Order 2 singlestep] (中間点 t_mid を使用):
+    λ_mid = (λ_t + λ_{t-1}) / 2
+    u = Order1(x_t → t_mid)              ... 中間点への Order 1 ステップ
+    x_{t-1} = Order1(x_t → t_{t-1})
+              − α_{t-1} * φ_1 / 2 * (D_θ(u, t_mid) − D_θ(x_t, t))
 
-[Order 2 singlestep] — 1 次補正項追加 (NFE=2)
-
-  中間点 t_mid: λ_mid = (λ_t + λ_{t-1}) / 2
-  u = step(x_t → t_mid) using Order 1
-
-  x_{t-1} = (α_{t-1}/α_t) * x_t
-             − α_{t-1} * (e^h − 1) * D_θ(x_t, t)
-             − α_{t-1}/2 * (e^h − 1) * [D_θ(u, t_mid) − D_θ(x_t, t)]
-
-  整理すると:
-  x_{t-1} = Order1_term
-             − α_{t-1}/2 * (e^h − 1) * ΔD
-
-  ΔD = D_θ(u, t_mid) − D_θ(x_t, t)   (1 次差分)
-
-[Order 2 multistep] — 前ステップ D_θ を再利用 (NFE=1)
-
-  ΔD = D_θ(x_t, t) − D_θ(x_{t_prev}, t_prev)
-
-  補正係数:
-    r = (λ_t − λ_{t_prev}) / (2 * h)   ... 前ステップ幅の比
-
-  x_{t-1} = Order1_term + α_{t-1} * (e^h−1)/h * r * ΔD * h
-
-[Order 3 singlestep] — 2 次補正項追加 (NFE=3)
-
-  中間点 t_1: λ_1 = λ_t + h/3
-  中間点 t_2: λ_2 = λ_t + 2h/3
-
-  各中間点で Order 1/2 step を実行して u_1, u_2 を取得。
-  3 点の D_θ から 2 次 Taylor 展開係数を計算して更新。
-
-[Order 3 multistep] — 前 2 ステップ再利用 (NFE=1)
-
-  D_0 = D_θ(x_t, t)          (現在)
-  D_1 = D_θ(x_{t-1}, t_1)    (前ステップ)
-  D_2 = D_θ(x_{t-2}, t_2)    (前々ステップ)
-
-  1 次差分: ΔD_0 = (D_0 − D_1) / r_0
-  2 次差分: ΔΔD  = (ΔD_0 − ΔD_1) / r_1
-
-  x_{t-1} = Order1_term
-             + 補正1 * ΔD_0
-             + 補正2 * ΔΔD
+  [Order 2 multistep] (前ステップの D_θ を再利用):
+    r_0 = h_prev / h                     ... 前ステップ幅の相対比
+          h_prev = λ_t − λ_{prev}
+    ΔD  = D_θ(x_t, t) − D_θ(x_{prev}, t_{prev})
+    x_{t-1} = Order1(x_t → t_{t-1})
+              + α_{t-1} * φ_1 / (2 * r_0) * ΔD
 """
 
 from __future__ import annotations
 
 from collections import deque
-from typing import Callable, Deque, Optional, Union
+from typing import Callable, Deque, Union
 
 import torch
-import math
 
-from .base import BaseSampler, SchedulerOutput, predict_x0
-from .euler import EulerSampler  # sigma スケジュール / scale_model_input を継承
+from .base import SchedulerOutput
+from .euler import EulerSampler
 
 
-class DPMSolver(EulerSampler):
+# =============================================================================
+# 共通基底クラス
+# =============================================================================
+
+class _DPMSolverBase(EulerSampler):
     """
-    DPM-Solver++ サンプラー (order=1/2/3, singlestep/multistep)。
+    DPM-Solver 各クラスが継承する共通基底。
 
-    EulerSampler を継承し sigma スケジュールを共有。
-    step() を DPM-Solver++ 公式で実装する。
+    EulerSampler からは以下を引き継ぐ:
+      - sigma スケジュール (_sigmas, _timestep_to_idx)
+      - scale_model_input()  : x / sqrt(σ²+1)  (EDM→VP 変換)
+      - _sigma_to_x0()       : model_output → x̂_0
+      - set_timesteps()      : σ 列の構築
 
-    Args:
-      order        : 1, 2, 3 のいずれか
-      solver_mode  : "singlestep" または "multistep"
-                     - singlestep: 各ステップで order 回 UNet フォワード
-                     - multistep : NFE=1/step、前ステップ結果を再利用
+    本クラスが追加するヘルパー:
+      - _get_lambda_alpha()  : t_idx → (λ_t, α_t)
+      - _get_denoiser()      : model_output + x → D_θ (= x̂_0)
+      - _order1_step()       : Order 1 の 1 ステップ更新
+      - _resolve_t_and_next(): timestep テンソル → (t, idx, t_next) インデックス
     """
-
-    def __init__(
-        self,
-        order: int = 2,
-        solver_mode: str = "multistep",
-        num_train_timesteps: int = 1000,
-        beta_start: float = 0.00085,
-        beta_end: float = 0.012,
-    ) -> None:
-        super().__init__(num_train_timesteps, beta_start, beta_end)
-        assert order in (1, 2, 3), f"order は 1, 2, 3 のいずれかを指定してください: {order}"
-        assert solver_mode in ("singlestep", "multistep"), (
-            f"solver_mode は 'singlestep' または 'multistep' を指定してください: {solver_mode}"
-        )
-        self.order = order
-        self.solver_mode = solver_mode
-
-        # multistep 用: 前ステップの D_θ 履歴 (maxlen = order-1)
-        self._model_output_buffer: Deque[torch.Tensor] = deque(maxlen=max(order - 1, 1))
-        # multistep 用: 対応する λ 値の履歴
-        self._lambda_buffer: Deque[float] = deque(maxlen=max(order - 1, 1))
-
-        # log-SNR (λ) テンソルはスケジュールから参照
-        # self.schedule.log_snr[t] = λ_t
-
-    def set_timesteps(
-        self,
-        num_inference_steps: int,
-        device: Union[str, torch.device] = "cpu",
-    ) -> None:
-        """
-        タイムステップ設定とバッファのリセット。
-        """
-        super().set_timesteps(num_inference_steps, device)
-        self._model_output_buffer.clear()
-        self._lambda_buffer.clear()
 
     # ----------------------------------------------------------------
-    # 共通ヘルパー
+    # スケジュール値取得
     # ----------------------------------------------------------------
 
-    def _get_alpha_sigma(self, t_idx: int, device: torch.device):
+    def _get_lambda_alpha(self, t_idx: int, device: torch.device):
         """
-        タイムステップインデックス t_idx から α_t, σ_t を取得。
+        タイムステップインデックス t_idx から (λ_t, α_t) を返す。
 
-        戻り値: (alpha_t, sigma_t, lambda_t)  全てスカラーテンソル
+        λ_t = log(ᾱ_t / (1−ᾱ_t))  (log-SNR)
+        α_t = sqrt(ᾱ_t)             (signal scale)
+
+        戻り値: (lambda_t, alpha_t)  いずれもスカラーテンソル
         """
-        alpha_t = self.schedule.sqrt_alphas_cumprod[t_idx].to(device)
-        sigma_t = self.schedule.sqrt_one_minus_alphas_cumprod[t_idx].to(device)
         lambda_t = self.schedule.log_snr[t_idx].to(device)
-        return alpha_t, sigma_t, lambda_t
+        alpha_t  = self.schedule.sqrt_alphas_cumprod[t_idx].to(device)
+        return lambda_t, alpha_t
+
+    # ----------------------------------------------------------------
+    # D_θ (denoiser = x̂_0) の計算
+    # ----------------------------------------------------------------
 
     def _get_denoiser(
         self,
-        v_pred: torch.Tensor,
+        model_output: torch.Tensor,
         x: torch.Tensor,
         t_idx: int,
     ) -> torch.Tensor:
         """
-        v_pred と x から D_θ (= x̂_0) を計算する。
+        UNet 出力 model_output と潜在変数 x から D_θ (= x̂_0) を計算する。
 
         ---------------------------------------------------------------
-        [数式] DPM-Solver++ の data-prediction form:
-          D_θ(x, t) = x̂_0 = α_t * x_t^orig − σ_t * v_θ
+        x は EDM 空間の未スケール潜在変数 (= pipeline の latents)。
+        UNet への入力は scale_model_input で x/c にスケールされているが、
+        step() には元の x が渡されるため、ここで再度スケールして x̂_0 を求める。
 
-          ただし UNet 入力は x_scaled = x / √(σ_ODE² + 1) なので
-          x_t^orig = x_scaled = x / c (c = √(σ_ODE²+1))
+        [v_prediction] (SD 2.x):
+          c = sqrt(σ_ODE² + 1)
+          x̂_0 = predict_x0(v_θ, x/c, 1/c, σ_ODE/c)
 
-          sigma_ODE[t_idx] から α_t, σ_t を再計算:
-            alpha_t = 1/√(σ_ODE²+1)
-            sigma_t = σ_ODE/√(σ_ODE²+1)
+        [epsilon] (SD 1.x):
+          x̂_0 = x − σ_ODE * ε_θ
         ---------------------------------------------------------------
+
+        Args:
+          model_output : UNet 出力テンソル (v_θ または ε_θ)
+          x            : EDM 空間の潜在変数 (未スケール)
+          t_idx        : タイムステップインデックス (整数)
+        Returns:
+          x̂_0 (clamp 済み, [-1, 1])
         """
         sigma_ode = self.schedule.sigmas_for_ode[t_idx].to(x.device)
-        x0_hat = self._sigma_to_x0(v_pred, x, sigma_ode)
+        x0_hat = self._sigma_to_x0(model_output, x, sigma_ode)
         return x0_hat.clamp(-1.0, 1.0)
 
     # ----------------------------------------------------------------
-    # Order 1 の基本更新 (= DDIM と等価)
+    # Order 1 の 1 ステップ更新
     # ----------------------------------------------------------------
 
     def _order1_step(
         self,
         x_t: torch.Tensor,
         d_theta_t: torch.Tensor,
-        alpha_t: torch.Tensor,
-        alpha_tm1: torch.Tensor,
         lambda_t: torch.Tensor,
         lambda_tm1: torch.Tensor,
+        alpha_t: torch.Tensor,
+        alpha_tm1: torch.Tensor,
     ) -> torch.Tensor:
         """
-        DPM-Solver++ Order 1 の更新式。
+        DPM-Solver++ Order 1 の 1 ステップを実行する。
 
         ---------------------------------------------------------------
-        [数式] DPM-Solver++ Order 1 (Lu et al. 2022, Eq.14):
+        [数式] DPM-Solver++ Eq.14:
 
-          h = λ_{t-1} − λ_t   (> 0, λ は単調増加方向)
+          h   = λ_{t-1} − λ_t          (> 0)
+          φ_1 = e^h − 1
 
-          x_{t-1} = (α_{t-1}/α_t) * x_t
-                    − α_{t-1} * (e^h − 1) * D_θ(x_t, t)
+          x_{t-1} = (α_{t-1} / α_t) * x_t
+                    − α_{t-1} * φ_1 * D_θ(x_t, t)
 
-          これは DDIM (η=0) と数学的に等価であることが証明されている。
+        DDIM (η=0) と数学的に等価 (Lu et al. 2022, Appendix B.1)。
 
-        変数対応:
-          x_t        ← x_t
-          d_theta_t  ← D_θ(x_t, t) = x̂_0
-          alpha_t    ← α_t = √ᾱ_t
-          alpha_tm1  ← α_{t-1} = √ᾱ_{t-1}
-          lambda_t   ← λ_t = log(α_t²/σ_t²)
-          lambda_tm1 ← λ_{t-1}
+        Args:
+          x_t       : 現在の潜在変数 x_i
+          d_theta_t : D_θ(x_t, t) = x̂_0
+          lambda_t  : λ_t  (現在の log-SNR)
+          lambda_tm1: λ_{t-1} (次ステップの log-SNR、λ_t より大きい)
+          alpha_t   : α_t = sqrt(ᾱ_t)
+          alpha_tm1 : α_{t-1} = sqrt(ᾱ_{t-1})
+        Returns:
+          x_{t-1}
         ---------------------------------------------------------------
         """
-        # h = λ_{t-1} − λ_t
-        h = lambda_tm1 - lambda_t
-        # φ_1 = e^h − 1
-        phi1 = torch.expm1(h)  # numerically stable than exp(h)-1
+        h    = lambda_tm1 - lambda_t          # > 0
+        phi1 = torch.expm1(h)                 # e^h − 1 (数値安定版)
 
-        # x_{t-1} = (α_{t-1}/α_t)*x_t − α_{t-1}*(e^h−1)*D_θ
         return (alpha_tm1 / alpha_t) * x_t - alpha_tm1 * phi1 * d_theta_t
 
     # ----------------------------------------------------------------
-    # step の実装
+    # タイムステップインデックスの解決
     # ----------------------------------------------------------------
+
+    def _resolve_t_and_next(self, timestep: torch.Tensor):
+        """
+        timestep テンソルから現在・次のタイムステップ値と idx を返す。
+
+        Returns:
+          (t, idx, t_next)
+            t      : 現在のタイムステップ値 (整数)
+            idx    : self.timesteps 上のインデックス
+            t_next : 次のタイムステップ値 (最後のステップは 0)
+        """
+        t     = int(timestep.item()) if timestep.ndim == 0 else int(timestep[0].item())
+        idx   = self._timestep_to_idx[t]
+        t_next = int(self.timesteps[idx + 1].item()) if idx + 1 < len(self.timesteps) else 0
+        return t, idx, t_next
+
+
+# =============================================================================
+# DPM-Solver-1 (Order 1 singlestep)
+# =============================================================================
+
+class DPMSolver1(_DPMSolverBase):
+    """
+    DPM-Solver-1: Order 1 singlestep サンプラー。
+
+    ---------------------------------------------------------------
+    特性:
+      タイプ   : ODE (決定論的)
+      NFE/step : 1
+      等価性   : DDIM (η=0) と数学的に等価
+      推奨ステップ数: 10–20 (品質は低め)
+
+    更新式 (DPM-Solver++ Eq.14):
+      h   = λ_{t-1} − λ_t
+      x_{t-1} = (α_{t-1}/α_t) * x_t − α_{t-1} * (e^h−1) * D_θ(x_t, t)
+
+    pipeline からは step() を呼ぶ (step_singlestep は不要)。
+    ---------------------------------------------------------------
+    """
 
     def step(
         self,
@@ -244,180 +235,80 @@ class DPMSolver(EulerSampler):
         sample: torch.Tensor,
     ) -> SchedulerOutput:
         """
-        DPM-Solver の 1 ステップを実行する。
+        DPM-Solver-1 の 1 ステップを実行する。
 
-        multistep の場合はこのメソッドのみで完結 (NFE=1)。
-        singlestep の order >= 2 の場合は追加の UNet フォワードが
-        必要なため、step_singlestep() を pipeline.py から呼ぶこと。
-
-        このメソッドは:
-          - Order 1: singlestep / multistep 両方対応
-          - Order 2 multistep: 前ステップ D_θ を再利用
-          - Order 3 multistep: 前 2 ステップ D_θ を再利用
-          - Order 2/3 singlestep: Euler フォールバック (要 step_singlestep)
+        Args:
+          model_output : UNet 出力 (v_θ または ε_θ)
+          timestep     : 現在のタイムステップテンソル
+          sample       : EDM 空間の潜在変数 x_t (未スケール)
+        Returns:
+          SchedulerOutput (prev_sample=x_{t-1}, pred_original_sample=x̂_0)
         """
-        t = int(timestep.item()) if timestep.ndim == 0 else int(timestep[0].item())
-        idx = self._timestep_to_idx[t]
-
         dev = sample.device
-        t_next_idx = idx + 1
-        # 次のタイムステップのインデックス (最後は 0 に近づく)
-        t_next = int(self.timesteps[t_next_idx].item()) if t_next_idx < len(self.timesteps) else 0
+        t, idx, t_next = self._resolve_t_and_next(timestep)
 
-        # スケジュール値の取得
-        alpha_t,  sigma_t,  lambda_t  = self._get_alpha_sigma(t, dev)
-        alpha_tm1, sigma_tm1, lambda_tm1 = self._get_alpha_sigma(t_next, dev)
+        # スケジュール値を取得
+        lambda_t,   alpha_t   = self._get_lambda_alpha(t,      dev)
+        lambda_tm1, alpha_tm1 = self._get_lambda_alpha(t_next, dev)
 
-        # D_θ (= x̂_0) を計算
+        # D_θ = x̂_0 を計算
         d_theta = self._get_denoiser(model_output, sample, t)
 
-        if self.solver_mode == "multistep":
-            x_next = self._multistep_update(
-                sample, d_theta,
-                alpha_t, alpha_tm1, lambda_t, lambda_tm1,
-            )
-        else:
-            # singlestep の order >= 2 は Euler フォールバック
-            # 本来は step_singlestep() を使うこと
-            x_next = self._order1_step(
-                sample, d_theta,
-                alpha_t, alpha_tm1, lambda_t, lambda_tm1,
-            )
-
-        # バッファを更新
-        self._model_output_buffer.append(d_theta)
-        self._lambda_buffer.append(float(lambda_t))
+        # Order 1 更新式を適用
+        x_next = self._order1_step(
+            sample, d_theta,
+            lambda_t, lambda_tm1,
+            alpha_t, alpha_tm1,
+        )
 
         return SchedulerOutput(prev_sample=x_next, pred_original_sample=d_theta)
 
-    def _multistep_update(
+
+# =============================================================================
+# DPM-Solver-2 singlestep (Order 2 singlestep)
+# =============================================================================
+
+class DPMSolver2Singlestep(_DPMSolverBase):
+    """
+    DPM-Solver-2 singlestep: Order 2 singlestep サンプラー。
+
+    ---------------------------------------------------------------
+    特性:
+      タイプ   : ODE (決定論的)
+      NFE/step : 2  (中間点で 2 回目の UNet フォワードを実行)
+      推奨ステップ数: 10–20
+
+    アルゴリズム概要 (DPM-Solver++ Eq.16):
+      Step 1: 中間点 t_mid を λ_mid = (λ_t + λ_{t-1})/2 で定義し、
+              Order 1 で x_t → u (at t_mid) を計算
+      Step 2: u を UNet に通して D_θ(u, t_mid) を取得
+      Step 3: 2 点の D_θ から 1 次 Taylor 補正を適用して x_{t-1} を計算
+
+    pipeline からは step_singlestep() を呼ぶこと。
+    (pipeline.py は isinstance(sampler, DPMSolver2Singlestep) で分岐)
+    ---------------------------------------------------------------
+    """
+
+    def step(
         self,
-        x_t: torch.Tensor,
-        d_theta_t: torch.Tensor,
-        alpha_t: torch.Tensor,
-        alpha_tm1: torch.Tensor,
-        lambda_t: torch.Tensor,
-        lambda_tm1: torch.Tensor,
-    ) -> torch.Tensor:
+        model_output: torch.Tensor,
+        timestep: torch.Tensor,
+        sample: torch.Tensor,
+    ) -> SchedulerOutput:
         """
-        Multistep モードの更新。現在のバッファ長に応じて order を自動決定。
+        フォールバック用 Order 1 ステップ。
 
-        ---------------------------------------------------------------
-        バッファ長 0 → order-1 (Euler) フォールバック
-        バッファ長 1 → order 2 multistep
-        バッファ長 2 → order 3 multistep (self.order==3 のとき)
-        ---------------------------------------------------------------
+        pipeline から step_singlestep() が呼ばれるため、
+        このメソッドが推論ループで呼ばれることは通常ない。
+        万が一直接呼ばれた場合は Order 1 として動作する。
         """
-        effective_order = min(self.order, len(self._model_output_buffer) + 1)
-
-        if effective_order == 1:
-            # --------------------------------------------------------
-            # Order 1 (= Euler / DDIM):
-            # [数式] x_{t-1} = (α_{t-1}/α_t)*x_t − α_{t-1}*(e^h−1)*D_θ
-            # --------------------------------------------------------
-            return self._order1_step(
-                x_t, d_theta_t, alpha_t, alpha_tm1, lambda_t, lambda_tm1
-            )
-
-        elif effective_order == 2:
-            # --------------------------------------------------------
-            # Order 2 multistep (Adams-Bashforth 風):
-            #
-            # [数式] (DPM-Solver++ Eq.17):
-            #
-            #   h = λ_{t-1} − λ_t
-            #   r_0 = (λ_t − λ_{prev}) / h   (前ステップの相対幅)
-            #
-            #   D_1 = (D_θ(x_t,t) − D_θ(x_{prev},t_{prev})) / r_0
-            #       = ΔD / r_0
-            #
-            #   x_{t-1} = order1_term + α_{t-1} * φ_1 / (2*r_0) * h * ΔD
-            #           = order1_term + α_{t-1} * (e^h−1) / (2*r_0) * ΔD
-            #
-            # ここで ΔD = D_θ_now − D_θ_prev (1 次差分)
-            # --------------------------------------------------------
-            d_prev = self._model_output_buffer[-1]
-            lambda_prev = self._lambda_buffer[-1]
-
-            h = lambda_tm1 - lambda_t
-            h_float = float(h)
-            if abs(h_float) < 1e-6:
-                # 最終ステップ (h≈0): order-1 にフォールバック
-                return self._order1_step(x_t, d_theta_t, alpha_t, alpha_tm1, lambda_t, lambda_tm1)
-            h_prev = float(lambda_t) - lambda_prev    # > 0
-            r_0 = h_prev / h_float
-
-            phi1 = torch.expm1(h)
-            order1 = self._order1_step(
-                x_t, d_theta_t, alpha_t, alpha_tm1, lambda_t, lambda_tm1
-            )
-
-            # ΔD = D_θ_now − D_θ_prev
-            delta_d = d_theta_t - d_prev
-            # 補正項: α_{t-1} * (e^h−1) / (2*r_0) * ΔD
-            correction = alpha_tm1 * phi1 / (2.0 * r_0) * delta_d
-
-            return order1 + correction
-
-        else:
-            # --------------------------------------------------------
-            # Order 3 multistep:
-            #
-            # [数式] (DPM-Solver++ Eq.18):
-            #
-            #   h = λ_{t-1} − λ_t
-            #   r_0 = h_1 / h   (1 つ前のステップ幅比)
-            #   r_1 = h_2 / h   (2 つ前のステップ幅比)
-            #
-            #   1 次差分:
-            #     D1_0 = (D_0 − D_1) / r_0
-            #     D1_1 = (D_1 − D_2) / r_1
-            #
-            #   2 次差分:
-            #     D2 = (D1_0 − D1_1) / (r_0 + r_1)
-            #
-            #   x_{t-1} = order1_term
-            #             + α_{t-1} * φ_1 * D1_0 / (2*r_0) * h
-            #             + α_{t-1} * φ_2 * D2        (3次項)
-            #
-            #   φ_2 = (e^h − 1 − h) / h   ... DPM-Solver Eq.4
-            # --------------------------------------------------------
-            d_prev1 = self._model_output_buffer[-1]  # D_θ_{t-1}
-            d_prev2 = self._model_output_buffer[-2]  # D_θ_{t-2}
-            lambda_1 = self._lambda_buffer[-1]       # λ_{t-1}
-            lambda_2 = self._lambda_buffer[-2]       # λ_{t-2}
-
-            h  = float(lambda_tm1 - lambda_t)
-            if abs(h) < 1e-6:
-                # 最終ステップ (h≈0): order-1 にフォールバック
-                return self._order1_step(x_t, d_theta_t, alpha_t, alpha_tm1, lambda_t, lambda_tm1)
-            h1 = float(lambda_t) - lambda_1
-            h2 = lambda_1 - lambda_2
-
-            r_0 = h1 / h
-            r_1 = h2 / h
-
-            # 1 次差分
-            D1_0 = (d_theta_t - d_prev1) / r_0
-            D1_1 = (d_prev1   - d_prev2) / r_1
-            # 2 次差分
-            D2 = (D1_0 - D1_1) / (r_0 + r_1)
-
-            phi1 = torch.expm1(torch.tensor(h, device=x_t.device, dtype=x_t.dtype))
-            # φ_2 = (e^h − 1 − h) / h
-            phi2 = (phi1 - h) / h
-
-            order1 = self._order1_step(
-                x_t, d_theta_t, alpha_t, alpha_tm1, lambda_t, lambda_tm1
-            )
-            correction1 = alpha_tm1 * phi1 / (2.0 * r_0) * (d_theta_t - d_prev1)
-            correction2 = alpha_tm1 * phi2 * D2
-
-            return order1 + correction1 + correction2
-
-    # ----------------------------------------------------------------
-    # Singlestep 用の完全ステップ (pipeline.py から呼ぶ)
-    # ----------------------------------------------------------------
+        dev = sample.device
+        t, idx, t_next = self._resolve_t_and_next(timestep)
+        lambda_t,   alpha_t   = self._get_lambda_alpha(t,      dev)
+        lambda_tm1, alpha_tm1 = self._get_lambda_alpha(t_next, dev)
+        d_theta = self._get_denoiser(model_output, sample, t)
+        x_next = self._order1_step(sample, d_theta, lambda_t, lambda_tm1, alpha_t, alpha_tm1)
+        return SchedulerOutput(prev_sample=x_next, pred_original_sample=d_theta)
 
     def step_singlestep(
         self,
@@ -429,182 +320,344 @@ class DPMSolver(EulerSampler):
         guidance_scale: float = 7.5,
     ) -> SchedulerOutput:
         """
-        DPM-Solver++ singlestep の完全ステップ。
-        order に応じて 1〜3 回の UNet フォワードを実行する。
+        DPM-Solver-2 singlestep の完全ステップ (NFE=2)。
+
+        pipeline.py から呼ばれる。1 ステップで 2 回 UNet を呼ぶ。
 
         ---------------------------------------------------------------
-        Order 2 singlestep (NFE=2):
+        [アルゴリズム] DPM-Solver++ Eq.16:
 
-        [数式] DPM-Solver++ Eq.16:
+        入力: x_t, 1 回目の UNet 出力 model_output (pipeline 側で計算済み)
+        出力: x_{t-1}
 
+        Step 1 — 中間点 t_mid を決定:
           λ_mid = (λ_t + λ_{t-1}) / 2
-          t_mid = λ^{-1}(λ_mid)   (λ の逆関数でタイムステップを求める)
+          t_mid = argmin_s |λ_s − λ_mid|   (離散スケジュールで最近傍)
 
-          Step 1: u = Order1_step(x_t → t_mid)
-          Step 2: D_θ_mid = D_θ(u, t_mid)
+        Step 2 — x_t から t_mid への Order 1 ステップ:
+          u = (α_mid/α_t)*x_t − α_mid*(e^{h_mid}−1)*D_θ(x_t, t)
+          ここで h_mid = λ_mid − λ_t
 
-          補正項:
-            h = λ_{t-1} − λ_t
-            x_{t-1} = Order1(x_t → t_1)
-                      − α_{t-1}*(e^h−1)/2 * (D_θ_mid − D_θ_t)
+        Step 3 — u を UNet に通して 2 点目の D_θ を取得:
+          u_scaled = u / sqrt(σ_ODE_mid² + 1)   (EDM→VP スケーリング)
+          v_mid = UNet(u_scaled, t_mid, enc_hs)
+          D_θ_mid = _get_denoiser(v_mid, u, t_mid)
 
-        Order 3 singlestep (NFE=3):
+        Step 4 — Order 2 補正を適用して x_{t-1} を計算:
+          h   = λ_{t-1} − λ_t
+          φ_1 = e^h − 1
+          ΔD  = D_θ(u, t_mid) − D_θ(x_t, t)   (1 次差分)
 
-        [数式] DPM-Solver++ Eq.19:
+          x_{t-1} = Order1(x_t → t_{t-1})
+                    − α_{t-1} * φ_1 / 2 * ΔD
 
-          λ_1 = λ_t + h/3,  λ_2 = λ_t + 2h/3
-          u_1 = Order1(x_t → t_1)
-          u_2 = Order2_singlestep(u_1 → t_2)
+          直感: Order 1 の誤差は D_θ の変化量 ΔD に比例するので、
+          中間点での 2 回目評価で ΔD を推定し補正する。
 
-          3 点の D_θ から 2 次 Taylor 展開でより精密に更新
+        Args:
+          model_output          : 1 回目の UNet 出力 (pipeline が計算済み)
+          timestep              : 現在のタイムステップ
+          sample                : EDM 空間の潜在変数 x_t
+          unet_forward_fn       : UNet フォワード fn(x_scaled, t, enc_hs) → v
+          encoder_hidden_states : テキスト埋め込み
+          guidance_scale        : CFG スケール (unet_forward_fn が内包)
         ---------------------------------------------------------------
         """
-        t = int(timestep.item()) if timestep.ndim == 0 else int(timestep[0].item())
-        idx = self._timestep_to_idx[t]
         dev = sample.device
+        t, idx, t_next = self._resolve_t_and_next(timestep)
 
-        t_next_idx = idx + 1
-        t_next = int(self.timesteps[t_next_idx].item()) if t_next_idx < len(self.timesteps) else 0
+        lambda_t,   alpha_t   = self._get_lambda_alpha(t,      dev)
+        lambda_tm1, alpha_tm1 = self._get_lambda_alpha(t_next, dev)
 
-        alpha_t,   sigma_t,   lambda_t   = self._get_alpha_sigma(t, dev)
-        alpha_tm1, sigma_tm1, lambda_tm1 = self._get_alpha_sigma(t_next, dev)
+        # 1 回目の D_θ = x̂_0
         d_theta_t = self._get_denoiser(model_output, sample, t)
 
-        # 最終ステップ (h≈0) は order-1 で処理
-        if abs(float(lambda_tm1 - lambda_t)) < 1e-6:
-            order1_result = self._order1_step(
-                sample, d_theta_t, alpha_t, alpha_tm1, lambda_t, lambda_tm1
-            )
-            return SchedulerOutput(prev_sample=order1_result, pred_original_sample=d_theta_t)
-
-        if self.order == 1:
-            # Order 1 は singlestep == multistep
+        # ----------------------------------------------------------
+        # 最終ステップ (h ≈ 0) は Order 1 にフォールバック
+        # λ_{t-1} ≈ λ_t となるのは t が最後のタイムステップの時
+        # ----------------------------------------------------------
+        h = float(lambda_tm1 - lambda_t)
+        if abs(h) < 1e-6:
             x_next = self._order1_step(
-                sample, d_theta_t, alpha_t, alpha_tm1, lambda_t, lambda_tm1
+                sample, d_theta_t, lambda_t, lambda_tm1, alpha_t, alpha_tm1
             )
             return SchedulerOutput(prev_sample=x_next, pred_original_sample=d_theta_t)
 
-        elif self.order == 2:
-            # ----------------------------------------------------------
-            # Order 2 singlestep:
-            # 中間点 λ_mid を求め 2 回目のフォワードを実行
-            # ----------------------------------------------------------
-            lambda_mid = (lambda_t + lambda_tm1) / 2.0
+        # ----------------------------------------------------------
+        # Step 1: 中間点 t_mid を λ 空間の中点で決定
+        # λ_mid = (λ_t + λ_{t-1}) / 2
+        # 離散スケジュールなので log_snr テーブルから最近傍インデックスを探す
+        # ----------------------------------------------------------
+        lambda_mid = (lambda_t + lambda_tm1) / 2.0
+        log_snr    = self.schedule.log_snr.to(dev)
+        t_mid_idx  = int(torch.argmin(torch.abs(log_snr - lambda_mid)).item())
 
-            # λ_mid に最も近いタイムステップインデックスを探す
-            log_snr = self.schedule.log_snr.to(dev)
-            t_mid_idx = int(torch.argmin(torch.abs(log_snr - lambda_mid)).item())
+        lambda_mid_actual, alpha_mid = self._get_lambda_alpha(t_mid_idx, dev)
 
-            alpha_mid, sigma_mid, _ = self._get_alpha_sigma(t_mid_idx, dev)
+        # ----------------------------------------------------------
+        # Step 2: x_t → u  (t → t_mid の Order 1 ステップ)
+        # h_mid = λ_mid − λ_t  (全ステップ幅 h の約半分)
+        # ----------------------------------------------------------
+        u = self._order1_step(
+            sample, d_theta_t,
+            lambda_t, lambda_mid_actual,
+            alpha_t, alpha_mid,
+        )
 
-            # Order 1 step: x_t → u (at t_mid)
-            u = self._order1_step(
-                sample, d_theta_t, alpha_t, alpha_mid, lambda_t, lambda_mid
+        # ----------------------------------------------------------
+        # Step 3: u を UNet に通して D_θ(u, t_mid) を取得
+        # u は EDM 空間なので、UNet 入力用に /c でスケールする
+        # c = sqrt(σ_ODE_mid² + 1)
+        # ----------------------------------------------------------
+        sigma_ode_mid = self.schedule.sigmas_for_ode[t_mid_idx].to(dev)
+        c_mid         = (sigma_ode_mid ** 2 + 1.0).sqrt()
+        u_scaled      = u / c_mid
+
+        v_mid       = unet_forward_fn(
+            u_scaled,
+            torch.tensor([t_mid_idx], device=dev),
+            encoder_hidden_states,
+        )
+        d_theta_mid = self._get_denoiser(v_mid, u, t_mid_idx)
+
+        # ----------------------------------------------------------
+        # Step 4: Order 2 補正を適用
+        #
+        # x_{t-1} = Order1(x_t → t_{t-1})
+        #           − α_{t-1} * φ_1 / 2 * (D_θ_mid − D_θ_t)
+        #
+        # 第 2 項は D_θ の変化率 ΔD を使った 1 次 Taylor 補正。
+        # ΔD > 0 ならノイズ推定が大きくなっているので x_{t-1} を補正。
+        # ----------------------------------------------------------
+        phi1    = torch.expm1(torch.tensor(h, device=dev, dtype=sample.dtype))
+        order1  = self._order1_step(
+            sample, d_theta_t, lambda_t, lambda_tm1, alpha_t, alpha_tm1
+        )
+        delta_d = d_theta_mid - d_theta_t                      # ΔD (1 次差分)
+        x_next  = order1 - alpha_tm1 * phi1 / 2.0 * delta_d
+
+        return SchedulerOutput(prev_sample=x_next, pred_original_sample=d_theta_t)
+
+
+# =============================================================================
+# DPM-Solver multistep Order 1
+# =============================================================================
+
+class DPMSolverMultistep1(_DPMSolverBase):
+    """
+    DPM-Solver multistep Order 1 サンプラー。
+
+    ---------------------------------------------------------------
+    特性:
+      タイプ   : ODE (決定論的)
+      NFE/step : 1
+      等価性   : DPMSolver1 および DDIM (η=0) と数学的に等価
+                 (multistep Order 1 は前ステップを再利用しないので
+                  singlestep Order 1 と同一の更新式になる)
+
+    更新式 (DPM-Solver++ Eq.14):
+      h   = λ_{t-1} − λ_t
+      x_{t-1} = (α_{t-1}/α_t) * x_t − α_{t-1} * (e^h−1) * D_θ(x_t, t)
+
+    DPMSolver1 と同じ計算だが、コードの対称性のため独立クラスとして定義。
+    ---------------------------------------------------------------
+    """
+
+    def step(
+        self,
+        model_output: torch.Tensor,
+        timestep: torch.Tensor,
+        sample: torch.Tensor,
+    ) -> SchedulerOutput:
+        """
+        DPM-Solver multistep Order 1 の 1 ステップを実行する。
+
+        Args:
+          model_output : UNet 出力
+          timestep     : 現在のタイムステップ
+          sample       : EDM 空間の潜在変数 x_t
+        Returns:
+          SchedulerOutput
+        """
+        dev = sample.device
+        t, idx, t_next = self._resolve_t_and_next(timestep)
+
+        lambda_t,   alpha_t   = self._get_lambda_alpha(t,      dev)
+        lambda_tm1, alpha_tm1 = self._get_lambda_alpha(t_next, dev)
+
+        d_theta = self._get_denoiser(model_output, sample, t)
+
+        x_next = self._order1_step(
+            sample, d_theta,
+            lambda_t, lambda_tm1,
+            alpha_t, alpha_tm1,
+        )
+
+        return SchedulerOutput(prev_sample=x_next, pred_original_sample=d_theta)
+
+
+# =============================================================================
+# DPM-Solver multistep Order 2
+# =============================================================================
+
+class DPMSolverMultistep2(_DPMSolverBase):
+    """
+    DPM-Solver multistep Order 2 サンプラー。
+
+    ---------------------------------------------------------------
+    特性:
+      タイプ   : ODE (決定論的)
+      NFE/step : 1  (前ステップの D_θ を再利用して 2 次精度を達成)
+      推奨ステップ数: 10–20
+
+    アルゴリズム概要 (DPM-Solver++ Eq.17, Adams-Bashforth 風):
+      - 各ステップで D_θ(x_t, t) を計算し deque に保存
+      - 最初のステップ (バッファ空) は Order 1 にフォールバック
+      - 2 ステップ目以降は前ステップの D_θ を再利用して補正を適用
+
+    更新式:
+      h    = λ_{t-1} − λ_t
+      h_prev = λ_t − λ_{prev}         (前ステップの λ 幅)
+      r_0  = h_prev / h                (前ステップ幅の相対比)
+      ΔD   = D_θ(x_t, t) − D_θ(x_{prev}, t_{prev})   (1 次差分)
+
+      x_{t-1} = Order1(x_t → t_{t-1})
+                + α_{t-1} * (e^h−1) / (2 * r_0) * ΔD
+
+    バッファ管理:
+      _d_theta_prev : 前ステップの D_θ (deque maxlen=1)
+      _lambda_prev  : 前ステップの λ_t (deque maxlen=1)
+    ---------------------------------------------------------------
+    """
+
+    def __init__(
+        self,
+        num_train_timesteps: int = 1000,
+        beta_start: float = 0.00085,
+        beta_end: float = 0.012,
+    ) -> None:
+        super().__init__(num_train_timesteps, beta_start, beta_end)
+        # 前ステップの D_θ と λ を保持するバッファ (maxlen=1)
+        self._d_theta_prev: Deque[torch.Tensor] = deque(maxlen=1)
+        self._lambda_prev:  Deque[float]         = deque(maxlen=1)
+
+    def set_timesteps(
+        self,
+        num_inference_steps: int,
+        device: Union[str, torch.device] = "cpu",
+    ) -> None:
+        """
+        タイムステップの設定とバッファのリセット。
+
+        set_timesteps() はエピソード (generate() 呼び出し) の開始時に
+        呼ばれるため、バッファをクリアして前エピソードの状態を破棄する。
+        """
+        super().set_timesteps(num_inference_steps, device)
+        self._d_theta_prev.clear()
+        self._lambda_prev.clear()
+
+    def step(
+        self,
+        model_output: torch.Tensor,
+        timestep: torch.Tensor,
+        sample: torch.Tensor,
+    ) -> SchedulerOutput:
+        """
+        DPM-Solver multistep Order 2 の 1 ステップを実行する。
+
+        バッファが空の場合 (最初のステップ) は Order 1 にフォールバックし、
+        次のステップ以降で Order 2 補正が有効になる。
+
+        ---------------------------------------------------------------
+        [アルゴリズム]:
+
+        Case A: バッファ空 (最初のステップ)
+          → Order 1 を適用し、D_θ と λ_t をバッファに保存
+
+        Case B: バッファあり (2 ステップ目以降)
+          h      = λ_{t-1} − λ_t
+          h_prev = λ_t − λ_{prev}
+          r_0    = h_prev / h
+
+          ΔD = D_θ_now − D_θ_prev   (前後 2 ステップの D_θ の差分)
+
+          補正項 = α_{t-1} * φ_1 / (2*r_0) * ΔD
+            ここで φ_1 = e^h − 1
+
+          x_{t-1} = Order1(x_t → t_{t-1}) + 補正項
+
+          直感: ΔD は D_θ の「変化速度」の推定。これを使って
+          Order 1 で無視していた高次項を補正する。
+          r_0 は前後のステップ幅が不均一な場合の正規化係数。
+
+        最後にバッファを現在の D_θ と λ_t で更新する。
+        ---------------------------------------------------------------
+
+        Args:
+          model_output : UNet 出力
+          timestep     : 現在のタイムステップ
+          sample       : EDM 空間の潜在変数 x_t
+        Returns:
+          SchedulerOutput
+        """
+        dev = sample.device
+        t, idx, t_next = self._resolve_t_and_next(timestep)
+
+        lambda_t,   alpha_t   = self._get_lambda_alpha(t,      dev)
+        lambda_tm1, alpha_tm1 = self._get_lambda_alpha(t_next, dev)
+
+        # 現ステップの D_θ = x̂_0
+        d_theta = self._get_denoiser(model_output, sample, t)
+
+        if len(self._d_theta_prev) == 0:
+            # --------------------------------------------------------
+            # Case A: 最初のステップ → Order 1 フォールバック
+            # バッファが空なので前ステップ情報がなく補正不可
+            # --------------------------------------------------------
+            x_next = self._order1_step(
+                sample, d_theta,
+                lambda_t, lambda_tm1,
+                alpha_t, alpha_tm1,
             )
-
-            # 2 回目の UNet フォワード
-            sigma_ode_mid = self.schedule.sigmas_for_ode[t_mid_idx].to(dev)
-            c_mid = (sigma_ode_mid ** 2 + 1.0).sqrt()
-            u_scaled = u / c_mid
-
-            t_mid_tensor = torch.tensor([t_mid_idx], device=dev)
-            v_mid = unet_forward_fn(u_scaled, t_mid_tensor, encoder_hidden_states)
-            d_theta_mid = self._get_denoiser(v_mid, u, t_mid_idx)
-
-            # ----------------------------------------------------------
-            # [数式] Order 2 singlestep 最終更新:
-            #
-            #   h = λ_{t-1} − λ_t
-            #   x_{t-1} = order1_term
-            #             − α_{t-1} * (e^h−1) / 2 * (D_θ_mid − D_θ_t)
-            # ----------------------------------------------------------
-            h = lambda_tm1 - lambda_t
-            phi1 = torch.expm1(h)
-            order1 = self._order1_step(
-                sample, d_theta_t, alpha_t, alpha_tm1, lambda_t, lambda_tm1
-            )
-            x_next = order1 - alpha_tm1 * phi1 / 2.0 * (d_theta_mid - d_theta_t)
-
-            return SchedulerOutput(prev_sample=x_next, pred_original_sample=d_theta_t)
-
         else:
-            # ----------------------------------------------------------
-            # Order 3 singlestep (NFE=3):
-            # λ_1 = λ_t + h/3,  λ_2 = λ_t + 2h/3 の 2 中間点を使う
-            # ----------------------------------------------------------
-            h = float(lambda_tm1 - lambda_t)
-            lambda_1 = lambda_t + h / 3.0
-            lambda_2 = lambda_t + 2.0 * h / 3.0
-            log_snr = self.schedule.log_snr.to(dev)
+            # --------------------------------------------------------
+            # Case B: 2 ステップ目以降 → Order 2 補正を適用
+            # --------------------------------------------------------
+            d_theta_prev = self._d_theta_prev[-1]
+            lambda_prev  = self._lambda_prev[-1]
 
-            t_1_idx = int(torch.argmin(torch.abs(log_snr - lambda_1)).item())
-            t_2_idx = int(torch.argmin(torch.abs(log_snr - lambda_2)).item())
+            h      = lambda_tm1 - lambda_t
+            h_float = float(h)
 
-            alpha_1, _, lambda_1_actual = self._get_alpha_sigma(t_1_idx, dev)
-            alpha_2, _, lambda_2_actual = self._get_alpha_sigma(t_2_idx, dev)
+            if abs(h_float) < 1e-6:
+                # 最終ステップ (h≈0): Order 1 にフォールバック
+                x_next = self._order1_step(
+                    sample, d_theta,
+                    lambda_t, lambda_tm1,
+                    alpha_t, alpha_tm1,
+                )
+            else:
+                h_prev = float(lambda_t) - lambda_prev   # > 0
+                r_0    = h_prev / h_float                # 前ステップ幅の相対比
 
-            # --- 中間点 u_1 ---
-            u_1 = self._order1_step(
-                sample, d_theta_t, alpha_t, alpha_1, lambda_t, lambda_1_actual
-            )
-            # UNet フォワード (2 回目)
-            sig_ode_1 = self.schedule.sigmas_for_ode[t_1_idx].to(dev)
-            c1 = (sig_ode_1 ** 2 + 1.0).sqrt()
-            v1 = unet_forward_fn(
-                u_1 / c1,
-                torch.tensor([t_1_idx], device=dev),
-                encoder_hidden_states,
-            )
-            d_theta_1 = self._get_denoiser(v1, u_1, t_1_idx)
+                # Order 1 ベース項
+                order1 = self._order1_step(
+                    sample, d_theta,
+                    lambda_t, lambda_tm1,
+                    alpha_t, alpha_tm1,
+                )
 
-            # --- 中間点 u_2 (Order 2 で計算) ---
-            u_2_order1 = self._order1_step(
-                sample, d_theta_t, alpha_t, alpha_2, lambda_t, lambda_2_actual
-            )
-            h_01 = float(lambda_1_actual - lambda_t)
-            h_02 = float(lambda_2_actual - lambda_t)
-            r = h_01 / h_02
-            phi1_02 = torch.expm1(torch.tensor(h_02, device=dev, dtype=sample.dtype))
-            u_2 = u_2_order1 - alpha_2 * phi1_02 / 2.0 * (d_theta_1 - d_theta_t)
+                # 1 次差分 ΔD = D_θ_now − D_θ_prev
+                delta_d = d_theta - d_theta_prev
 
-            # UNet フォワード (3 回目)
-            sig_ode_2 = self.schedule.sigmas_for_ode[t_2_idx].to(dev)
-            c2 = (sig_ode_2 ** 2 + 1.0).sqrt()
-            v2 = unet_forward_fn(
-                u_2 / c2,
-                torch.tensor([t_2_idx], device=dev),
-                encoder_hidden_states,
-            )
-            d_theta_2 = self._get_denoiser(v2, u_2, t_2_idx)
+                # 補正項: α_{t-1} * (e^h−1) / (2*r_0) * ΔD
+                phi1       = torch.expm1(h)
+                correction = alpha_tm1 * phi1 / (2.0 * r_0) * delta_d
 
-            # ----------------------------------------------------------
-            # [数式] Order 3 singlestep 最終更新 (簡略形):
-            #
-            #   h = λ_{t-1} − λ_t
-            #   D1 = (D_θ_1 − D_θ_t) / (h/3)
-            #   D2 = (D_θ_2 − D_θ_t) / (2h/3)
-            #   D2nd = (D2 − D1) / (2h/3 − h/3) = (D2 − D1) / (h/3)
-            #
-            #   x_{t-1} = order1_term
-            #             − α_{t-1}*(e^h−1)/2 * (D_θ_2 − D_θ_t)
-            #             + α_{t-1}*(φ_1 - 1) / 3 * D2nd * h
-            # ----------------------------------------------------------
-            h_t = torch.tensor(h, device=dev, dtype=sample.dtype)
-            phi1 = torch.expm1(h_t)
-            phi2 = (phi1 - h_t) / h_t  # (e^h − 1 − h) / h
+                x_next = order1 + correction
 
-            order1 = self._order1_step(
-                sample, d_theta_t, alpha_t, alpha_tm1, lambda_t, lambda_tm1
-            )
+        # バッファを現在のステップで更新
+        self._d_theta_prev.append(d_theta)
+        self._lambda_prev.append(float(lambda_t))
 
-            D1   = (d_theta_1 - d_theta_t) / (h / 3.0)
-            D2   = (d_theta_2 - d_theta_t) / (2.0 * h / 3.0)
-            D2nd = (D2 - D1) / (h / 3.0)
-
-            x_next = (
-                order1
-                - alpha_tm1 * phi1 / 2.0 * (d_theta_2 - d_theta_t)
-                + alpha_tm1 * phi2 / 3.0 * D2nd * h_t
-            )
-
-            return SchedulerOutput(prev_sample=x_next, pred_original_sample=d_theta_t)
+        return SchedulerOutput(prev_sample=x_next, pred_original_sample=d_theta)

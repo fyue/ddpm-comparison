@@ -36,7 +36,7 @@ import torch.nn.functional as F
 from diffusers import AutoencoderKL, UNet2DConditionModel
 from transformers import CLIPTextModel, CLIPTokenizer
 
-from samplers import BaseSampler, HeunSampler, DPMSolver, SAMPLER_REGISTRY
+from samplers import BaseSampler, HeunSampler, DPMSolver2Singlestep, SAMPLER_REGISTRY
 
 
 # =============================================================================
@@ -388,7 +388,7 @@ class SDPipeline:
                     encoder_hidden_states=encoder_hidden_states,
                     guidance_scale=guidance_scale,
                 )
-            elif isinstance(sampler, DPMSolver) and sampler.solver_mode == "singlestep" and sampler.order >= 2:
+            elif isinstance(sampler, DPMSolver2Singlestep):
                 # DPM-Solver singlestep order >= 2: 追加の UNet フォワードが必要
                 output = sampler.step_singlestep(
                     model_output=model_output,

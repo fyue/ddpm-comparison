@@ -8,7 +8,12 @@ from .ddim import DDIMSampler
 from .euler import EulerSampler
 from .heun import HeunSampler
 from .lms2 import LMS2Sampler
-from .dpm_solver import DPMSolver
+from .dpm_solver import (
+    DPMSolver1,
+    DPMSolver2Singlestep,
+    DPMSolverMultistep1,
+    DPMSolverMultistep2,
+)
 
 __all__ = [
     "BaseSampler",
@@ -21,7 +26,10 @@ __all__ = [
     "EulerSampler",
     "HeunSampler",
     "LMS2Sampler",
-    "DPMSolver",
+    "DPMSolver1",
+    "DPMSolver2Singlestep",
+    "DPMSolverMultistep1",
+    "DPMSolverMultistep2",
 ]
 
 # ----------------------------------------------------------------
@@ -34,11 +42,9 @@ SAMPLER_REGISTRY = {
     "euler":              {"cls": EulerSampler, "kwargs": {}},
     "heun":               {"cls": HeunSampler,  "kwargs": {}},
     "lms2":               {"cls": LMS2Sampler,  "kwargs": {}},
-    "dpm_solver_1":       {"cls": DPMSolver,    "kwargs": {"order": 1, "solver_mode": "singlestep"}},
-    "dpm_solver_2_single":{"cls": DPMSolver,    "kwargs": {"order": 2, "solver_mode": "singlestep"}},
-    "dpm_solver_2_multi": {"cls": DPMSolver,    "kwargs": {"order": 2, "solver_mode": "multistep"}},
-    "dpm_solver_3_single":{"cls": DPMSolver,    "kwargs": {"order": 3, "solver_mode": "singlestep"}},
-    "dpm_solver_3_multi": {"cls": DPMSolver,    "kwargs": {"order": 3, "solver_mode": "multistep"}},
+    "dpm_solver_1":        {"cls": DPMSolver1,           "kwargs": {}},
+    "dpm_solver_2_single": {"cls": DPMSolver2Singlestep, "kwargs": {}},
+    "dpm_solver_2_multi":  {"cls": DPMSolverMultistep2,  "kwargs": {}},
 }
 
 # NFE (Network Function Evaluations) per step の情報
@@ -51,8 +57,6 @@ NFE_PER_STEP = {
     "dpm_solver_1":        1,
     "dpm_solver_2_single": 2,
     "dpm_solver_2_multi":  1,
-    "dpm_solver_3_single": 3,
-    "dpm_solver_3_multi":  1,
 }
 
 
